@@ -268,15 +268,36 @@ def parse_account_string(account_str: str) -> dict:
 
 
 
-def extract_otp_code(text: str) -> List[str]:
+def normalize_game_filter(game: Optional[str]) -> Optional[str]:
+    """Chuẩn hoá keyword game truyền từ frontend về 1 trong 2 giá trị
+    'poe' / 'diablo', hoặc None nếu không xác định (không lọc gì cả).
+    PoE1 và PoE2 dùng chung 1 loại mã nên đều map về 'poe'."""
+    if not game:
+        return None
+    g = game.strip().lower()
+    if 'diablo' in g:
+        return 'diablo'
+    if 'poe' in g or 'path of exile' in g:
+        return 'poe'
+    return None
+
+
+def extract_otp_code(text: str, game: Optional[str] = None) -> List[str]:
     """Trích xuất danh sách mã xác nhận OTP. Hỗ trợ 2 định dạng:
     - PoE/Xsolla: 12 ký tự có 2 dấu - (VD: cfa-808-6def)
     - Battle.net/Diablo: 6 ký tự chữ+số, KHÔNG dấu gạch, luôn đứng ngay sau
       cụm "security code" trong email "Battle.net Account Verification"
       (VD: "Here's your security code: G6MJTJ")
+
+    `game` = 'poe' | 'diablo' | None. Khi biết chắc game (vd tab Diablo 4 /
+    Path of Exile) thì CHỈ tìm đúng định dạng của game đó — tránh trả nhầm
+    mã của game khác nếu email đó vô tình có cả 2 loại mail lẫn lộn.
+    Khi game=None (chưa xác định, vd trang Quản lý Email) thì tìm cả 2.
     """
     if not text:
         return []
+
+    game = normalize_game_filter(game)
 
     # 1. Loại bỏ các khối <style>...</style> và <script>...</script>
     clean = re.sub(r'<style[^>]*>.*?</style>', ' ', text, flags=re.DOTALL | re.IGNORECASE)
@@ -289,17 +310,21 @@ def extract_otp_code(text: str) -> List[str]:
     # 3. Strip toàn bộ HTML tags
     clean = re.sub(r'<[^>]+>', ' ', clean)
 
-    # 4. Mã dạng 12 ký tự có 2 dấu -: [a-zA-Z0-9]{3,4}-[a-zA-Z0-9]{3,4}-[a-zA-Z0-9]{3,4}
-    matches = re.findall(r'\b[a-zA-Z0-9]{3,4}-[a-zA-Z0-9]{3,4}-[a-zA-Z0-9]{3,4}\b', clean)
-    filtered = [c for c in matches if len(c) == 12 and c.count('-') == 2]
+    filtered = []
 
-    # 5. Mã Battle.net/Diablo dạng 6 ký tự chữ+số, không dấu gạch. Bắt buộc
-    # gắn liền cụm "security code" để tránh false-positive với ID ngẫu nhiên
-    # khác lẫn trong email.
-    battlenet_matches = re.findall(
-        r'security code:?\s*\r?\n*\s*([A-Za-z0-9]{6})\b', clean, flags=re.IGNORECASE
-    )
-    filtered.extend(m for m in battlenet_matches if len(m) == 6)
+    if game in (None, 'poe'):
+        # 4. Mã dạng 12 ký tự có 2 dấu -: [a-zA-Z0-9]{3,4}-[a-zA-Z0-9]{3,4}-[a-zA-Z0-9]{3,4}
+        matches = re.findall(r'\b[a-zA-Z0-9]{3,4}-[a-zA-Z0-9]{3,4}-[a-zA-Z0-9]{3,4}\b', clean)
+        filtered.extend(c for c in matches if len(c) == 12 and c.count('-') == 2)
+
+    if game in (None, 'diablo'):
+        # 5. Mã Battle.net/Diablo dạng 6 ký tự chữ+số, không dấu gạch. Bắt
+        # buộc gắn liền cụm "security code" để tránh false-positive với ID
+        # ngẫu nhiên khác lẫn trong email.
+        battlenet_matches = re.findall(
+            r'security code:?\s*\r?\n*\s*([A-Za-z0-9]{6})\b', clean, flags=re.IGNORECASE
+        )
+        filtered.extend(m for m in battlenet_matches if len(m) == 6)
 
     seen = set()
     unique_codes = []
@@ -954,6 +979,13 @@ def get_verification_code(req: AccountCodeRequest):
                 otp_code=None
             )
 
+        # Game bên frontend truyền vào qua keyword (VD: "Diablo 4", "Path of
+        # Exile", "Path of Exile 2", hoặc "poe"/"diablo" trực tiếp). None =
+        # chưa xác định game -> tìm cả 2 định dạng như trước (trang Quản lý
+        # Email tự xử lý mở modal cho chọn ở phía frontend khi gặp trường
+        # hợp này).
+        game_filter = normalize_game_filter(req.keyword)
+
         parsed_email_items: List[EmailItem] = []
         for msg in messages:
             sub = getattr(msg, 'subject', '') or ''
@@ -963,8 +995,8 @@ def get_verification_code(req: AccountCodeRequest):
             has_att = bool(getattr(msg, 'has_attachments', False))
 
             full_body = str(getattr(msg, 'body', '') or bp)
-            c_sub = extract_otp_code(sub)
-            c_body = extract_otp_code(full_body)
+            c_sub = extract_otp_code(sub, game=game_filter)
+            c_body = extract_otp_code(full_body, game=game_filter)
             msg_codes = list(dict.fromkeys(c_sub + c_body))
 
             parsed_email_items.append(EmailItem(
