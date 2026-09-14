@@ -269,7 +269,12 @@ def parse_account_string(account_str: str) -> dict:
 
 
 def extract_otp_code(text: str) -> List[str]:
-    """Trích xuất danh sách mã xác nhận OTP chuẩn 12 ký tự có 2 dấu - (VD: cfa-808-6def)"""
+    """Trích xuất danh sách mã xác nhận OTP. Hỗ trợ 2 định dạng:
+    - PoE/Xsolla: 12 ký tự có 2 dấu - (VD: cfa-808-6def)
+    - Battle.net/Diablo: 6 ký tự chữ+số, KHÔNG dấu gạch, luôn đứng ngay sau
+      cụm "security code" trong email "Battle.net Account Verification"
+      (VD: "Here's your security code: G6MJTJ")
+    """
     if not text:
         return []
 
@@ -284,9 +289,17 @@ def extract_otp_code(text: str) -> List[str]:
     # 3. Strip toàn bộ HTML tags
     clean = re.sub(r'<[^>]+>', ' ', clean)
 
-    # 4. Chỉ lọc mã dạng 12 ký tự có 2 dấu -: [a-zA-Z0-9]{3,4}-[a-zA-Z0-9]{3,4}-[a-zA-Z0-9]{3,4}
+    # 4. Mã dạng 12 ký tự có 2 dấu -: [a-zA-Z0-9]{3,4}-[a-zA-Z0-9]{3,4}-[a-zA-Z0-9]{3,4}
     matches = re.findall(r'\b[a-zA-Z0-9]{3,4}-[a-zA-Z0-9]{3,4}-[a-zA-Z0-9]{3,4}\b', clean)
     filtered = [c for c in matches if len(c) == 12 and c.count('-') == 2]
+
+    # 5. Mã Battle.net/Diablo dạng 6 ký tự chữ+số, không dấu gạch. Bắt buộc
+    # gắn liền cụm "security code" để tránh false-positive với ID ngẫu nhiên
+    # khác lẫn trong email.
+    battlenet_matches = re.findall(
+        r'security code:?\s*\r?\n*\s*([A-Za-z0-9]{6})\b', clean, flags=re.IGNORECASE
+    )
+    filtered.extend(m for m in battlenet_matches if len(m) == 6)
 
     seen = set()
     unique_codes = []
