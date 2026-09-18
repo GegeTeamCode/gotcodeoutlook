@@ -5,11 +5,17 @@ API Server & Web UI: Dịch vụ trích xuất mã xác nhận (OTP) và hiển 
 import re
 import sys
 import json
+import socket
+import imaplib
 import sqlite3
 import requests
 from pathlib import Path
 from typing import Optional, List, Union
 from unittest.mock import MagicMock
+from datetime import timezone
+from email import message_from_bytes
+from email.header import decode_header
+from email.utils import parsedate_to_datetime
 
 try:
     from fastapi import FastAPI, HTTPException, Query
@@ -253,17 +259,204 @@ class OTPCodeResponse(BaseModel):
     all_messages: List[EmailItem] = []
 
 
+# ---------------------------------------------------------------------------
+# Gmail / IMAP
+# ---------------------------------------------------------------------------
+# Gmail không dùng refresh_token như Microsoft Graph mà đọc bằng IMAP với App
+# Password (mật khẩu ứng dụng 16 ký tự, tạo sau khi bật xác minh 2 bước).
+# Script Key của tài khoản Gmail vì vậy chỉ cần 2 trường:
+#     email@gmail.com|app_password
+IMAP_PROVIDERS = {
+    'gmail.com': ('imap.gmail.com', 993),
+    'googlemail.com': ('imap.gmail.com', 993),
+}
+
+IMAP_TIMEOUT = 20
+
+
+class ImapAuthError(Exception):
+    """Google từ chối đăng nhập IMAP: sai App Password hoặc chưa bật IMAP."""
+
+
+def detect_provider(email_addr: str) -> str:
+    """Trả về 'imap' nếu tên miền đọc bằng IMAP (Gmail), ngược lại 'microsoft'."""
+    addr = email_addr or ''
+    domain = addr.split('@')[-1].strip().lower() if '@' in addr else ''
+    return 'imap' if domain in IMAP_PROVIDERS else 'microsoft'
+
+
+def _imap_decode_header(raw_value: Optional[str]) -> str:
+    """Giải mã header MIME (=?UTF-8?B?...?=) về chuỗi thường."""
+    if not raw_value:
+        return ''
+    chunks = []
+    try:
+        for chunk, charset in decode_header(raw_value):
+            if isinstance(chunk, bytes):
+                chunks.append(chunk.decode(charset or 'utf-8', errors='replace'))
+            else:
+                chunks.append(chunk)
+    except Exception:
+        return str(raw_value)
+    return ''.join(chunks).strip()
+
+
+def _imap_message_body(msg) -> tuple:
+    """Trả về (body, has_attachments). Ưu tiên text/plain, không có thì lấy
+    text/html — extract_otp_code đã tự strip thẻ HTML nên truyền thẳng được."""
+    plain_parts: List[str] = []
+    html_parts: List[str] = []
+    has_attachments = False
+
+    parts = msg.walk() if msg.is_multipart() else [msg]
+    for part in parts:
+        if part.is_multipart():
+            continue
+        disposition = str(part.get('Content-Disposition') or '').lower()
+        content_type = part.get_content_type()
+        if 'attachment' in disposition:
+            has_attachments = True
+            continue
+        if content_type not in ('text/plain', 'text/html'):
+            continue
+        payload = part.get_payload(decode=True)
+        if payload is None:
+            continue
+        charset = part.get_content_charset() or 'utf-8'
+        try:
+            text = payload.decode(charset, errors='replace')
+        except LookupError:
+            text = payload.decode('utf-8', errors='replace')
+        if content_type == 'text/plain':
+            plain_parts.append(text)
+        else:
+            html_parts.append(text)
+
+    body = "\n".join(plain_parts).strip() or "\n".join(html_parts).strip()
+    return body, has_attachments
+
+
+def _imap_spam_folders(conn) -> List[str]:
+    """Tìm thư mục spam qua cờ special-use \\Junk. Tên hiển thị của Gmail đổi
+    theo ngôn ngữ giao diện ([Gmail]/Spam, [Gmail]/Thư rác...) nên không
+    hardcode được."""
+    folders: List[str] = []
+    try:
+        typ, data = conn.list()
+    except Exception:
+        return folders
+    if typ != 'OK' or not data:
+        return folders
+    for raw in data:
+        line = raw.decode('utf-8', errors='replace') if isinstance(raw, bytes) else str(raw)
+        if '\\Junk' not in line and '\\Spam' not in line:
+            continue
+        matched = re.search(r'"([^"]+)"\s*$', line.strip())
+        name = matched.group(1) if matched else line.strip().split(' ')[-1]
+        if name and name not in folders:
+            folders.append(name)
+    return folders
+
+
+def fetch_messages_via_imap(username: str, app_password: str, limit: int = 15) -> List[dict]:
+    """Đọc `limit` email mới nhất ở Hộp thư đến + Spam qua IMAP và trả về danh
+    sách dict cùng định dạng với nhánh Microsoft Graph."""
+    domain = (username or '').split('@')[-1].strip().lower()
+    host, port = IMAP_PROVIDERS[domain]
+
+    try:
+        conn = imaplib.IMAP4_SSL(host, port, timeout=IMAP_TIMEOUT)
+    except (socket.timeout, OSError) as err:
+        raise ConnectionError(f"Không kết nối được tới {host}:{port} ({err})")
+
+    items: List[dict] = []
+    try:
+        try:
+            conn.login(username, app_password)
+        except imaplib.IMAP4.error as err:
+            raise ImapAuthError(str(err))
+
+        for folder in ['INBOX'] + _imap_spam_folders(conn):
+            try:
+                typ, _ = conn.select(f'"{folder}"', readonly=True)
+                if typ != 'OK':
+                    continue
+                typ, data = conn.search(None, 'ALL')
+                if typ != 'OK' or not data or not data[0]:
+                    continue
+
+                for msg_id in reversed(data[0].split()[-limit:]):
+                    # BODY.PEEK[] để KHÔNG đánh dấu email thành đã đọc
+                    typ, msg_data = conn.fetch(msg_id, '(BODY.PEEK[])')
+                    if typ != 'OK' or not msg_data:
+                        continue
+                    raw_bytes = next(
+                        (p[1] for p in msg_data if isinstance(p, tuple) and len(p) > 1),
+                        None,
+                    )
+                    if not raw_bytes:
+                        continue
+
+                    parsed = message_from_bytes(raw_bytes)
+                    body, has_attachments = _imap_message_body(parsed)
+                    try:
+                        received = parsedate_to_datetime(parsed.get('Date'))
+                        created_date = received.astimezone(timezone.utc).strftime('%Y-%m-%d %H:%M:%S+00:00')
+                    except Exception:
+                        created_date = ''
+
+                    preview = re.sub(r'\s+', ' ', body).strip()[:255]
+                    items.append({
+                        'id': f"{folder}:{msg_id.decode(errors='replace')}",
+                        'subject': _imap_decode_header(parsed.get('Subject')),
+                        'sender': _imap_decode_header(parsed.get('From')),
+                        'created_date': created_date,
+                        'body_preview': preview,
+                        'body': body,
+                        'has_attachments': has_attachments,
+                    })
+            except imaplib.IMAP4.error:
+                continue
+    finally:
+        try:
+            conn.logout()
+        except Exception:
+            pass
+
+    items.sort(key=lambda x: x['created_date'], reverse=True)
+    return items[:limit]
+
+
+def _graph_msg_to_dict(msg) -> dict:
+    """Đưa message của python-o365 về cùng định dạng dict với nhánh IMAP."""
+    body_preview = getattr(msg, 'body_preview', str(getattr(msg, 'body', '') or '')) or ''
+    return {
+        'id': str(getattr(msg, 'object_id', 'msg_id')),
+        'subject': getattr(msg, 'subject', '') or '',
+        'sender': str(getattr(msg, 'sender', '') or ''),
+        'created_date': str(getattr(msg, 'created', '') or getattr(msg, 'received', '') or ''),
+        'body_preview': body_preview,
+        'body': str(getattr(msg, 'body', '') or body_preview),
+        'has_attachments': bool(getattr(msg, 'has_attachments', False)),
+    }
+
+
 def parse_account_string(account_str: str) -> dict:
-    """Bóc tách dòng thông tin tài khoản định dạng: email|password|refresh_token|client_id"""
+    """Bóc tách dòng thông tin tài khoản. Hỗ trợ 2 định dạng:
+    - Microsoft (Outlook/Hotmail): email|password|refresh_token|client_id
+    - Gmail: email|app_password (App Password 16 ký tự, đọc thư bằng IMAP)
+    Khóa 'provider' cho biết đi đường nào: 'microsoft' hay 'imap'."""
     parts = [p.strip() for p in account_str.split('|')]
     rf = parts[2] if len(parts) > 2 else ''
     # Loại bỏ các dấu $ thừa ở cuối chuỗi token (nếu có)
     rf = rf.rstrip('$')
+    username = parts[0] if len(parts) > 0 else ''
     return {
-        'username': parts[0] if len(parts) > 0 else '',
+        'username': username,
         'password': parts[1] if len(parts) > 1 else '',
         'refresh_token': rf,
-        'client_id': parts[3] if len(parts) > 3 else ''
+        'client_id': parts[3] if len(parts) > 3 else '',
+        'provider': detect_provider(username)
     }
 
 
@@ -838,9 +1031,13 @@ def get_verification_code(req: AccountCodeRequest):
         if db_acc and '|' in db_acc:
             account_str = db_acc
         else:
+            if detect_provider(raw_input) == 'imap':
+                key_hint = "email@gmail.com|app_password (App Password 16 ký tự của Google)"
+            else:
+                key_hint = "email|password|refresh_token|client_id"
             raise HTTPException(
                 status_code=400,
-                detail=f"Tài khoản '{raw_input}' chưa có Script Key (chuỗi token đầy đủ email|password|refresh_token|client_id). Vui lòng bổ sung Script Key.",
+                detail=f"Tài khoản '{raw_input}' chưa có Script Key. Vui lòng bổ sung Script Key dạng: {key_hint}",
             )
 
     # Tự động lưu/cập nhật tài khoản vào SQLite DB
@@ -853,11 +1050,52 @@ def get_verification_code(req: AccountCodeRequest):
     if not username:
         raise HTTPException(status_code=400, detail="Chuỗi account_str không chứa địa chỉ email hợp lệ.")
 
-    protocol = MSGraphProtocol(api_version='v1.0')
-    account = Account((client_id,), protocol=protocol, auth_flow_type='public', username=username)
+    provider = acc_info.get('provider') or 'microsoft'
+    performed_by = req.user.strip() if req.user and req.user.strip() else "System"
+    imap_messages: Optional[List[dict]] = None
+    account = None
+
+    if provider == 'imap':
+        # Gmail: đọc thẳng bằng IMAP + App Password, không có OAuth/refresh_token
+        app_password = (acc_info.get('password') or '').replace(' ', '')
+        if not app_password:
+            detail_msg = (
+                f"Tài khoản Gmail '{username}' chưa có App Password. Bật xác minh 2 bước rồi tạo "
+                f"App Password tại myaccount.google.com/apppasswords và nhập Script Key dạng "
+                f"{username}|app_password."
+            )
+            add_account_log(username, action="FETCH_OTP_FAILED", details=detail_msg, user=performed_by)
+            raise HTTPException(
+                status_code=400,
+                detail={"error_code": "GMAIL_APP_PASSWORD_MISSING", "message": detail_msg, "email": username},
+            )
+
+        try:
+            imap_messages = fetch_messages_via_imap(username, app_password, req.limit)
+        except ImapAuthError as err:
+            detail_msg = (
+                f"Google từ chối đăng nhập IMAP cho '{username}'. Kiểm tra: App Password còn hiệu lực "
+                f"(đổi mật khẩu Gmail sẽ thu hồi toàn bộ App Password), đã bật IMAP trong Cài đặt Gmail, "
+                f"và tài khoản không bật Advanced Protection. Chi tiết: {err}"
+            )
+            add_account_log(username, action="FETCH_OTP_FAILED", details=detail_msg, user=performed_by)
+            raise HTTPException(
+                status_code=400,
+                detail={"error_code": "GMAIL_AUTH_FAILED", "message": detail_msg, "email": username},
+            )
+        except ConnectionError as err:
+            detail_msg = f"Không kết nối được máy chủ IMAP của Gmail cho '{username}': {err}"
+            add_account_log(username, action="FETCH_OTP_FAILED", details=detail_msg, user=performed_by)
+            raise HTTPException(
+                status_code=502,
+                detail={"error_code": "GMAIL_IMAP_UNREACHABLE", "message": detail_msg, "email": username},
+            )
+    else:
+        protocol = MSGraphProtocol(api_version='v1.0')
+        account = Account((client_id,), protocol=protocol, auth_flow_type='public', username=username)
 
 
-    if req.use_mock:
+    if req.use_mock and provider != 'imap':
         account.con = MagicMock()
         account.con.token_backend.has_data = True
         account.con.token_backend.token_is_expired.return_value = False
@@ -888,7 +1126,7 @@ def get_verification_code(req: AccountCodeRequest):
             ]
         }
         account.con.get.return_value = mock_response
-    else:
+    elif provider != 'imap':
         refresh_token = acc_info.get('refresh_token')
         if refresh_token:
             import requests
@@ -947,32 +1185,37 @@ def get_verification_code(req: AccountCodeRequest):
 
 
     try:
-        mailbox = account.mailbox()
-        folders_to_check = []
-        try:
-            folders_to_check.append(mailbox.inbox_folder())
-        except Exception:
-            pass
-        try:
-            junk_f = mailbox.junk_folder()
-            if junk_f:
-                folders_to_check.append(junk_f)
-        except Exception:
-            pass
-
-        messages = []
-        for folder in folders_to_check:
+        if provider == 'imap':
+            raw_messages = imap_messages or []
+        else:
+            mailbox = account.mailbox()
+            folders_to_check = []
             try:
-                folder_msgs = list(folder.get_messages(limit=req.limit, order_by='receivedDateTime desc'))
-                messages.extend(folder_msgs)
+                folders_to_check.append(mailbox.inbox_folder())
             except Exception:
+                pass
+            try:
+                junk_f = mailbox.junk_folder()
+                if junk_f:
+                    folders_to_check.append(junk_f)
+            except Exception:
+                pass
+
+            messages = []
+            for folder in folders_to_check:
                 try:
-                    folder_msgs = list(folder.get_messages(limit=req.limit))
+                    folder_msgs = list(folder.get_messages(limit=req.limit, order_by='receivedDateTime desc'))
                     messages.extend(folder_msgs)
                 except Exception:
-                    pass
+                    try:
+                        folder_msgs = list(folder.get_messages(limit=req.limit))
+                        messages.extend(folder_msgs)
+                    except Exception:
+                        pass
 
-        if not messages:
+            raw_messages = [_graph_msg_to_dict(m) for m in messages]
+
+        if not raw_messages:
             return OTPCodeResponse(
                 status="no_messages_found",
                 email=username,
@@ -987,26 +1230,19 @@ def get_verification_code(req: AccountCodeRequest):
         game_filter = normalize_game_filter(req.keyword)
 
         parsed_email_items: List[EmailItem] = []
-        for msg in messages:
-            sub = getattr(msg, 'subject', '') or ''
-            bp = getattr(msg, 'body_preview', str(getattr(msg, 'body', '') or '')) or ''
-            snd = str(getattr(msg, 'sender', '') or '')
-            dt_str = str(getattr(msg, 'created', '') or getattr(msg, 'received', '') or '')
-            has_att = bool(getattr(msg, 'has_attachments', False))
-
-            full_body = str(getattr(msg, 'body', '') or bp)
-            c_sub = extract_otp_code(sub, game=game_filter)
-            c_body = extract_otp_code(full_body, game=game_filter)
+        for item in raw_messages:
+            c_sub = extract_otp_code(item['subject'], game=game_filter)
+            c_body = extract_otp_code(item['body'], game=game_filter)
             msg_codes = list(dict.fromkeys(c_sub + c_body))
 
             parsed_email_items.append(EmailItem(
-                id=str(getattr(msg, 'object_id', 'msg_id')),
-                subject=sub,
-                sender=snd,
-                created_date=dt_str,
-                body_preview=bp,
-                body=full_body,
-                has_attachments=has_att,
+                id=item['id'],
+                subject=item['subject'],
+                sender=item['sender'],
+                created_date=item['created_date'],
+                body_preview=item['body_preview'],
+                body=item['body'],
+                has_attachments=item['has_attachments'],
                 otp_codes=msg_codes
             ))
 
@@ -1059,13 +1295,14 @@ def get_verification_code(req: AccountCodeRequest):
 
     except Exception as e:
         performed_by = req.user.strip() if req.user and req.user.strip() else "System"
+        mailbox_label = "Gmail (IMAP)" if provider == 'imap' else "Outlook"
         add_account_log(
             username,
             action="FETCH_OTP_FAILED",
-            details=f"Lỗi khi đọc hòm thư Outlook: {str(e)}",
+            details=f"Lỗi khi đọc hòm thư {mailbox_label}: {str(e)}",
             user=performed_by,
         )
-        raise HTTPException(status_code=500, detail=f"Lỗi khi đọc hòm thư Outlook: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Lỗi khi đọc hòm thư {mailbox_label}: {str(e)}")
 
 
 class SettingsPayload(BaseModel):
