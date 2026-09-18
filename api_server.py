@@ -11,17 +11,14 @@ import sqlite3
 import requests
 from pathlib import Path
 from typing import Optional, List, Union
-from unittest.mock import MagicMock
 from datetime import timezone
 from email import message_from_bytes
 from email.header import decode_header
 from email.utils import parsedate_to_datetime
 
 try:
-    from fastapi import FastAPI, HTTPException, Query
+    from fastapi import FastAPI, HTTPException
     from fastapi.middleware.cors import CORSMiddleware
-    from fastapi.staticfiles import StaticFiles
-    from fastapi.responses import FileResponse
     from pydantic import BaseModel, Field
     import uvicorn
     from O365 import Account, MSGraphProtocol
@@ -210,12 +207,6 @@ app.add_middleware(
 )
 
 
-# Phục vụ các tệp tĩnh (CSS, JS, Images)
-static_dir = Path(__file__).parent / "static"
-static_dir.mkdir(parents=True, exist_ok=True)
-app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
-
-
 
 class AccountCodeRequest(BaseModel):
     account_str: str = Field(
@@ -227,10 +218,6 @@ class AccountCodeRequest(BaseModel):
         description="Từ khóa lọc email (VD: OTP, code, mã xác nhận, Facebook...)",
     )
     limit: int = Field(default=15, ge=1, le=50, description="Số lượng email gần nhất cần quét")
-    use_mock: bool = Field(
-        default=False,
-        description="Đặt True để chạy test dữ liệu giả lập, False để kết nối mail thật",
-    )
     user: Optional[str] = Field(default=None, description="Tên người thực hiện")
 
 
@@ -544,24 +531,6 @@ class AddAccountRequest(BaseModel):
     account_str: str = Field(..., description="Dòng thông tin tài khoản dạng email|password|refresh_token|client_id")
 
 
-@app.get("/")
-def read_root():
-    """Phục vụ trang Giao diện Web UI Dashboard"""
-    index_file = static_dir / "index.html"
-    if index_file.exists():
-        return FileResponse(index_file)
-    return {"message": "Web UI chưa khởi tạo. Vui lòng tạo static/index.html"}
-
-
-@app.get("/admin")
-def read_admin():
-    """Phục vụ trang Giao diện Quản trị SQLite Database Admin"""
-    admin_file = static_dir / "admin.html"
-    if admin_file.exists():
-        return FileResponse(admin_file)
-    return {"message": "Admin Web UI chưa khởi tạo. Vui lòng tạo static/admin.html"}
-
-
 @app.get("/api/status")
 def get_server_status():
     """Endpoint kiểm tra trạng thái hoạt động của Python O365 API Server per User Rule #5"""
@@ -711,18 +680,6 @@ def update_account_body(req: UpdateAccountRequest):
     """Cập nhật thông tin tài khoản via Body JSON"""
     return process_update_account(
         target_email=req.email, account_str=req.account_str, status=req.status, user=req.user
-    )
-
-
-@app.put("/api/accounts/{email:path}")
-def update_account_path(email: str, req: UpdateAccountRequest):
-    """Cập nhật thông tin tài khoản via Path Email"""
-    clean_email = email if email and email != "update" else None
-    return process_update_account(
-        target_email=clean_email or req.email,
-        account_str=req.account_str,
-        status=req.status,
-        user=req.user,
     )
 
 
@@ -973,7 +930,6 @@ def manual_renew_token_endpoint(req: RenewTokenRequest):
         )
 
 
-@app.delete("/api/accounts/delete/{email:path}")
 @app.delete("/api/accounts/{email:path}")
 def delete_account(email: str, user: Optional[str] = None):
     """Xóa tài khoản khỏi SQLite Database theo email"""
@@ -988,16 +944,6 @@ def delete_account(email: str, user: Optional[str] = None):
     performed_by = user.strip() if user and user.strip() else "System"
     add_account_log(email, action="DELETE", details="Xóa tài khoản khỏi SQLite Database", user=performed_by)
     return {"status": "success", "message": f"Đã xóa tài khoản {email} khỏi SQLite Database"}
-
-
-@app.get("/api/get-code-by-email")
-def get_code_by_email_get(email: str = Query(..., description="Địa chỉ email tài khoản Outlook")):
-    """
-    Endpoint tra cứu mã OTP nhanh dạng GET.
-    Ví dụ: GET /api/get-code-by-email?email=sylvesterrojas997795@outlook.com
-    """
-    code_req = AccountCodeRequest(account_str=email)
-    return get_verification_code(code_req)
 
 
 @app.post("/api/get-code-by-email")
@@ -1095,38 +1041,7 @@ def get_verification_code(req: AccountCodeRequest):
         account = Account((client_id,), protocol=protocol, auth_flow_type='public', username=username)
 
 
-    if req.use_mock and provider != 'imap':
-        account.con = MagicMock()
-        account.con.token_backend.has_data = True
-        account.con.token_backend.token_is_expired.return_value = False
-        account.con.token_backend.token_is_long_lived.return_value = True
-
-        mock_response = MagicMock()
-        mock_response.status_code = 200
-        mock_response.json.return_value = {
-            'value': [
-                {
-                    'id': 'msg_mock_001',
-                    'subject': 'Mã xác nhận đăng nhập của bạn là 849201',
-                    'bodyPreview': 'Mã OTP để hoàn tất xác minh tài khoản của bạn là 849201. Vui lòng không chia sẻ mã này.',
-                    'sender': {'emailAddress': {'name': 'Security Team', 'address': 'no-reply@security.com'}},
-                    'isRead': False,
-                    'hasAttachments': False,
-                    'createdDateTime': '2026-08-08T11:20:00Z'
-                },
-                {
-                    'id': 'msg_mock_002',
-                    'subject': 'Xác nhận đơn hàng #99482',
-                    'bodyPreview': 'Đơn hàng Path Of Exile của bạn đã được xác nhận thành công.',
-                    'sender': {'emailAddress': {'name': 'Xsolla Mailer', 'address': 'mailer@xsolla.com'}},
-                    'isRead': True,
-                    'hasAttachments': True,
-                    'createdDateTime': '2026-08-07T14:30:00Z'
-                }
-            ]
-        }
-        account.con.get.return_value = mock_response
-    elif provider != 'imap':
+    if provider != 'imap':
         refresh_token = acc_info.get('refresh_token')
         if refresh_token:
             import requests
