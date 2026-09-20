@@ -1305,6 +1305,10 @@ def save_settings(payload: SettingsPayload):
 if __name__ == '__main__':
     import os
     port = int(os.environ.get("PORT", 8005))
-    print(f"Đang khởi chạy API Server & Web UI Dashboard tại http://0.0.0.0:{port}...")
-    uvicorn.run("api_server:app", host="0.0.0.0", port=port, reload=False)
+    # Mặc định chỉ nghe loopback: API này trả credential thô (mật khẩu, refresh token,
+    # app password) và không có lớp xác thực nào của riêng nó. Mở ra LAN là phơi toàn bộ
+    # hòm thư. Đường vào hợp lệ là proxy /o365-api của nginx, vốn chặn bằng phiên Frappe.
+    host = os.environ.get("HOST", "127.0.0.1")
+    print(f"Đang khởi chạy API Server & Web UI Dashboard tại http://{host}:{port}...")
+    uvicorn.run("api_server:app", host=host, port=port, reload=False)
 
