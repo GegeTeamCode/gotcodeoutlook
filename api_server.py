@@ -455,6 +455,8 @@ def normalize_game_filter(game: Optional[str]) -> Optional[str]:
     if not game:
         return None
     g = game.strip().lower()
+    if 'steam' in g:
+        return 'steam'
     if 'diablo' in g:
         return 'diablo'
     if 'poe' in g or 'path of exile' in g:
@@ -466,6 +468,14 @@ def normalize_game_filter(game: Optional[str]) -> Optional[str]:
 # Blizzard gửi mail theo ngôn ngữ region của account (không đổi được từ phía
 # mình), nên phải nhận diện nhãn ở nhiều thứ tiếng — account mua lại từ Hàn
 # Quốc trả về mail "Battle.net 계정 인증" với nhãn "인증번호:".
+# Steam Guard: mail tu steampowered.com chua ma 5 ky tự (chu+cso). Nhan dien
+# qua nhan "Steam Guard code..." hoac ma dung mot minh tren dong trong mail Steam.
+STEAM_HINT_RE = re.compile(r'steampowered|steam guard|steam support', re.IGNORECASE)
+STEAM_LABEL_RE = re.compile(
+    r'(?:steam guard code|M\u00e3 Steam Guard)\D{0,60}?\b([A-Z0-9]{5})\b', re.IGNORECASE
+)
+STEAM_STANDALONE_LINE_RE = re.compile(r'^\s*([A-Z0-9]{5})\s*$', re.MULTILINE)
+
 BATTLENET_CODE_LABELS = [
     r'security code',
     r'인증\s*번호', r'보안\s*코드',                      # Hàn
@@ -545,6 +555,24 @@ def extract_otp_code(text: str, game: Optional[str] = None, sender: Optional[str
         # 4. Mã dạng 12 ký tự có 2 dấu -: [a-zA-Z0-9]{3,4}-[a-zA-Z0-9]{3,4}-[a-zA-Z0-9]{3,4}
         matches = re.findall(r'\b[a-zA-Z0-9]{3,4}-[a-zA-Z0-9]{3,4}-[a-zA-Z0-9]{3,4}\b', clean)
         filtered.extend(c for c in matches if len(c) == 12 and c.count('-') == 2)
+
+    if game in (None, 'steam'):
+        steam_matches = [
+            m
+            for m in STEAM_LABEL_RE.findall(clean)
+            if len(m) == 5 and any(ch.isdigit() for ch in m)
+        ]
+        if not steam_matches:
+            hint_src = (sender or '') + ' ' + clean
+            if STEAM_HINT_RE.search(hint_src):
+                steam_matches = [
+                    m
+                    for m in STEAM_STANDALONE_LINE_RE.findall(clean)
+                    if len(m) == 5
+                    and any(ch.isdigit() for ch in m)
+                    and any(ch.isalpha() for ch in m)
+                ]
+        filtered.extend(steam_matches)
 
     if game in (None, 'diablo'):
         # 5. Mã Battle.net/Diablo dạng 6 ký tự chữ+số, không dấu gạch. Ưu tiên
