@@ -3,6 +3,7 @@
 Chạy: python3 tests_manual/test_extract_otp_code.py
 Không cần mạng, không cần accounts.db — chỉ import hàm thuần từ api_server.
 """
+import re
 import sys
 from pathlib import Path
 
@@ -43,30 +44,57 @@ GOOGLE_ALERT_BODY = (
 )
 GOOGLE_SENDER = 'Google <no-reply@accounts.google.com>'
 
-STEAM_SENDER = '"Steam" <noreply@steampowered.com>'
-# Ma mot minh tren dong (template nhieu dong).
-STEAM_MULTILINE = (
-    '<td>Here is the Steam Guard code you need to login to account acc123:</td>\r\n'
-    '<td style="font-size:48px; font-family:Arial, \'Motiva Sans\';">\r\n  7KQ4M   </td>\r\n'
-    '<td>Login attempt from a computer located at 1.2.3.4 (VN).</td>'
+STEAM_SENDER = 'Steam Support <noreply@steampowered.com>'
+# Trich tu mail that "Your Steam account: Access from new computer" (ten account
+# va quoc gia da doi). Luu y: ban HTML KHONG co nhan "Login Code" - ngay truoc o
+# chua ma la ten quoc gia.
+STEAM_HTML = (
+    '<td class="title-36 pb-30 c-grey6 fw-b" style="font-size:36px;">\n\t\t\tacc123,\t\t</td>\n'
+    '<td style="font-size:18px;">\n\t\t\tIt looks like you are trying to log in from a new device. '
+    'Here is the Steam Guard code you need to access your account:\t\t</td>\n'
+    '<table width="100%" border="0" cellspacing="0" cellpadding="0">\n\t<tr>\n'
+    '\t\t<td style="font-size:18px; line-height:25px; font-family:Arial, sans-serif, \'Motiva Sans\'; '
+    'color:#8f98a0; text-align:center;">\n\t\t\tRequest made from\t\t</td>\n\t</tr>\n\t<tr>\n'
+    '\t\t<td style="font-size:25px; color:#f1f1f1; text-align:center;letter-spacing:1px">\n'
+    '\t\t\tVietnam\t\t</td>\n\t</tr>\n\t<tr>\n\t\t<td style="padding-bottom: 16px"></td>\n\t</tr>\n\t<tr>\n'
+    '\t\t<td class="title-48 c-blue1 fw-b a-center" style="font-size:48px; line-height:52px; '
+    'font-family:Arial, sans-serif, \'Motiva Sans\'; color:#3a9aed; font-weight:bold; text-align:center;">\n'
+    '\t\t\tCY2QG\t\t</td>\n\t</tr>\n</table>\n'
+    '<td>If this wasn\'t you</td>\n<td>The login code contained in this email is required to access '
+    'your account.</td>\n<td>PO Box 1688 Bellevue, WA 98009</td>\n'
+    '<a href="https://help.steampowered.com">https://help.steampowered.com</a>'
 )
-# Exchange/Graph tra HTML don 1 dong.
-STEAM_MINIFIED = (
-    '<html><body><table><tr><td>Login Code</td></tr><tr><td style="font-size:48px">7KQ4M</td></tr>'
-    '<tr><td>Request made from Vietnam</td></tr></table>'
-    '<a href="https://store.steampowered.com">Steam</a></body></html>'
+
+
+def exchange_like(body):
+    """Gia lap HTML do Exchange/Graph tra ve: bo khoang trang giua cac the, don
+    het ve 1 dong, them tien to x_ vao class."""
+    flat = re.sub(r'>\s+<', '><', body)
+    return re.sub(r'\s+', ' ', flat).replace('class="', 'class="x_')
+
+
+# Ban text/plain cua cung mail do (duong IMAP uu tien text/plain).
+STEAM_TEXT = (
+    'Dear acc123,\n\nIt looks like you are trying to log in from a new device. Here is the Steam\n'
+    'Guard code you need to access your account:\n\nRequest made from\nVietnam\n\nLogin Code\nCY2QG\n\n\n\n'
+    'If this wasn\'t you\n\nThe login code contained in this email is required to access your account.\n'
+    'https://help.steampowered.com\n'
 )
-# Ma toan chu (bang chu Steam khong co nguyen am) + &nbsp; dinh sau ma.
-STEAM_ALL_LETTERS = '<td>Login Code</td><td>KFMWV&nbsp;</td> <p>Steam Support</p>'
-STEAM_PLAIN = (
-    'Dear acc123,\r\n\r\nHere is the Steam Guard code you need to login to '
-    'account acc123:\r\n\r\n7KQ4M\r\n\r\nThe Steam Support Team'
+# Template cu hon (van con gap).
+STEAM_TEXT_OLD = (
+    'Dear acc123,\nHere is the Steam Guard code you need to login to account acc123:\n\n6VCC5\n'
+    'This email was generated because of a login attempt from a web or mobile device located at '
+    '1.2.3.4 (VN).\n\nThe Steam Team\nhttps://help.steampowered.com\n'
 )
-STEAM_PLAIN_INLINE = 'Your Steam Guard code: 7KQ4M (Steam Support)'
+# body_preview: toan bo noi dung nam tren 1 dong.
+STEAM_PREVIEW = (
+    'Dear acc123, It looks like you are trying to log in from a new device. Here is the Steam Guard '
+    'code you need to access your account: Request made from Vietnam Login Code CY2QG If this wasn\'t you'
+)
 # Mail thong bao khong co ma - khong duoc tra tu 5 ky tu bat ky ("email", "STEAM"...).
 STEAM_NO_CODE = (
-    '<p>New sign in to Steam</p><p>Your Steam Guard code was used to sign in from a new '
-    'device. Check your email and CLICK here.</p><p>STEAM</p><p>98009</p>'
+    '<td class="title-48 c-blue1">New sign in to Steam</td><p>Your Steam Guard code was used to sign '
+    'in from a new device. Check your email and CLICK here.</p><p>STEAM</p><p>98009</p>'
 )
 
 
@@ -90,14 +118,25 @@ def main():
               extract_otp_code(GOOGLE_ALERT_BODY, None, GOOGLE_SENDER), []),
         check("Mail thuong khong phai Battle.net khong bi quet bua",
               extract_otp_code('<p>Order #ABC123 delivered</p>', 'diablo', 'G2G <noreply@g2g.com>'), []),
-        check("Steam: ma mot minh tren dong", extract_otp_code(STEAM_MULTILINE, 'steam', STEAM_SENDER), ['7KQ4M']),
-        check("Steam: HTML don 1 dong", extract_otp_code(STEAM_MINIFIED, 'steam', STEAM_SENDER), ['7KQ4M']),
-        check("Steam: ma toan chu + &nbsp;", extract_otp_code(STEAM_ALL_LETTERS, 'steam', STEAM_SENDER), ['KFMWV']),
-        check("Steam: mail thuan text", extract_otp_code(STEAM_PLAIN, 'steam', STEAM_SENDER), ['7KQ4M']),
-        check("Steam: ma cung dong voi nhan", extract_otp_code(STEAM_PLAIN_INLINE, 'steam', STEAM_SENDER), ['7KQ4M']),
-        check("Steam: game=None van ra ma", extract_otp_code(STEAM_MINIFIED, None, STEAM_SENDER), ['7KQ4M']),
+        check("Steam: HTML mail that", extract_otp_code(STEAM_HTML, 'steam', STEAM_SENDER), ['CY2QG']),
+        check("Steam: HTML kieu Exchange (don 1 dong, class x_)",
+              extract_otp_code(exchange_like(STEAM_HTML), 'steam', STEAM_SENDER), ['CY2QG']),
+        check("Steam: CRLF + &nbsp; canh ma",
+              extract_otp_code(STEAM_HTML.replace('CY2QG', 'CY2QG&nbsp;').replace('\n', '\r\n'), 'steam', STEAM_SENDER),
+              ['CY2QG']),
+        check("Steam: ma toan chu", extract_otp_code(exchange_like(STEAM_HTML.replace('CY2QG', 'KFMWV')), 'steam', STEAM_SENDER), ['KFMWV']),
+        check("Steam: ma ngoai bang chu van lay duoc tu o chua ma",
+              extract_otp_code(exchange_like(STEAM_HTML.replace('CY2QG', 'S0L1Z')), 'steam', STEAM_SENDER), ['S0L1Z']),
+        check("Steam: text/plain", extract_otp_code(STEAM_TEXT, 'steam', STEAM_SENDER), ['CY2QG']),
+        check("Steam: text/plain CRLF, ma ngoai bang chu (sau nhan Login Code)",
+              extract_otp_code(STEAM_TEXT.replace('CY2QG', 'S0L1Z').replace('\n', '\r\n'), 'steam', STEAM_SENDER), ['S0L1Z']),
+        check("Steam: template cu", extract_otp_code(STEAM_TEXT_OLD, 'steam', STEAM_SENDER), ['6VCC5']),
+        check("Steam: body_preview 1 dong", extract_otp_code(STEAM_PREVIEW, 'steam', STEAM_SENDER), ['CY2QG']),
+        check("Steam: game=None van ra ma", extract_otp_code(exchange_like(STEAM_HTML), None, STEAM_SENDER), ['CY2QG']),
+        check("Steam: tieu de mail khong chua ma",
+              extract_otp_code('Your Steam account: Access from new computer', 'steam', STEAM_SENDER), []),
         check("Steam: mail thong bao khong co ma", extract_otp_code(STEAM_NO_CODE, 'steam', STEAM_SENDER), []),
-        check("Steam: game=diablo khong tra ma Steam", extract_otp_code(STEAM_MINIFIED, 'diablo', STEAM_SENDER), []),
+        check("Steam: game=diablo khong tra ma Steam", extract_otp_code(STEAM_HTML, 'diablo', STEAM_SENDER), []),
         check("Steam: mail khong phai Steam khong bi quet",
               extract_otp_code('<p>Order</p><p>7KQ4M</p>', 'steam', 'G2G <noreply@g2g.com>'), []),
     ]

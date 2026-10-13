@@ -469,29 +469,53 @@ def normalize_game_filter(game: Optional[str]) -> Optional[str]:
 # Blizzard gửi mail theo ngôn ngữ region của account (không đổi được từ phía
 # mình), nên phải nhận diện nhãn ở nhiều thứ tiếng — account mua lại từ Hàn
 # Quốc trả về mail "Battle.net 계정 인증" với nhãn "인증번호:".
-# Steam Guard: ma 5 ky tu lay tu bang chu rieng cua Steam (khong nguyen am,
-# khong 0/1) nen co the TOAN CHU hoac toan so - khong duoc ep "phai co chu so".
-# Trong mail HTML ma nam mot minh trong 1 o <td>; Exchange/Graph hay tra HTML
-# don 1 dong va chen &nbsp;, nen phai tach theo THE (moi text node 1 dong) chu
-# khong dua vao xuong dong co san trong HTML.
+# Steam Guard qua email. Da doi chieu voi mail that "Your Steam account: Access
+# from new computer" / "... new web or mobile device":
+#   HTML : <td class="title-48 c-blue1 fw-b a-center" ...>\n\t\tCY2QG\t\t</td>
+#          (HTML KHONG co nhan "Login Code"; ngay truoc ma la ten quoc gia)
+#   text : "Login Code\nCY2QG"  -  mau cu: "...login to account NAME:\n\n6VCC5"
+# Exchange/Graph tra HTML da don dong (class them tien to x_) nen khong duoc dua
+# vao xuong dong co san: tach moi THE thanh 1 dong roi moi xet "ma dung mot minh".
+# Ma 5 ky tu lay tu bang chu rieng cua Steam (khong nguyen am, khong 0/1) nen co
+# the TOAN CHU - khong duoc ep "phai co chu so".
 STEAM_HINT_RE = re.compile(r'steampowered|steam guard|steam support', re.IGNORECASE)
 STEAM_CODE = r'[23456789BCDFGHJKMNPQRTVWXY]{5}'
-STEAM_STANDALONE_LINE_RE = re.compile(r'^[ \t]*(' + STEAM_CODE + r')[ \t]*$', re.MULTILINE)
-# Mail thuan text kieu "... Steam Guard code: 7KQ4M" (ma cung dong voi nhan).
-STEAM_LABEL_RE = re.compile(
-    r'(?i:steam guard code|m\u00e3 steam guard|login code)[^\n]{0,80}?'
-    r'(?<![A-Za-z0-9])(' + STEAM_CODE + r')(?![A-Za-z0-9])'
+STEAM_ANY_CODE = r'[A-Z0-9]{5}'
+# 1) O chua ma cua template HTML (nhan theo class, khong phu thuoc bang chu).
+STEAM_CODE_CELL_RE = re.compile(
+    r'<td\b[^>]*\bclass\s*=\s*["\'][^"\']*title-48[^"\']*["\'][^>]*>(.*?)</td>',
+    re.DOTALL | re.IGNORECASE,
 )
+# 2) Ma dung ngay sau nhan (ban text/plain, body_preview).
+STEAM_AFTER_LABEL_RE = re.compile(
+    r'(?i:login code|steam guard code you need to login to account[ \t]+\S+[ \t]*:'
+    r'|steam guard code[ \t]*:)\s+(' + STEAM_ANY_CODE + r')(?![A-Za-z0-9])'
+)
+# 3) Ma dung mot minh tren 1 dong / 1 text node (moi template, moi ngon ngu).
+STEAM_STANDALONE_LINE_RE = re.compile(r'^[ \t]*(' + STEAM_CODE + r')[ \t]*$', re.MULTILINE)
+
+
+def _steam_plain(fragment: str) -> str:
+    """HTML -> text, moi the thanh 1 xuong dong (moi text node nam rieng 1 dong)."""
+    out = re.sub(r'<(style|script)\b[^>]*>.*?</\1>', ' ', fragment, flags=re.DOTALL | re.IGNORECASE)
+    out = html.unescape(re.sub(r'<[^>]+>', '\n', out))
+    out = re.sub(r'[​-‏⁠﻿­]', '', out)
+    return re.sub(r'[\xa0 -  　]', ' ', out).replace('\r', '\n')
 
 
 def extract_steam_codes(text: str, sender: str = '') -> List[str]:
     """Ma Steam Guard trong 1 mail. Chi quet khi chac chan la mail cua Steam."""
     if not STEAM_HINT_RE.search((sender or '') + ' ' + text):
         return []
-    body = re.sub(r'<(style|script)[^>]*>.*?</\1>', ' ', text, flags=re.DOTALL | re.IGNORECASE)
-    body = re.sub(r'<[^>]+>', '\n', body)
-    body = html.unescape(body).replace('\xa0', ' ').replace('\u200b', '').replace('\r', '\n')
-    return STEAM_STANDALONE_LINE_RE.findall(body) + STEAM_LABEL_RE.findall(body)
+    codes = []
+    for cell in STEAM_CODE_CELL_RE.findall(text):
+        value = _steam_plain(cell).strip()
+        if re.fullmatch(STEAM_ANY_CODE, value):
+            codes.append(value)
+    plain = _steam_plain(text)
+    codes.extend(STEAM_AFTER_LABEL_RE.findall(plain))
+    codes.extend(STEAM_STANDALONE_LINE_RE.findall(plain))
+    return codes
 
 
 BATTLENET_CODE_LABELS = [
