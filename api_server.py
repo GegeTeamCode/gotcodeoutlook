@@ -3,6 +3,7 @@ API Server & Web UI: Dịch vụ trích xuất mã xác nhận (OTP) và hiển 
 """
 
 import re
+import html
 import sys
 import json
 import socket
@@ -468,13 +469,30 @@ def normalize_game_filter(game: Optional[str]) -> Optional[str]:
 # Blizzard gửi mail theo ngôn ngữ region của account (không đổi được từ phía
 # mình), nên phải nhận diện nhãn ở nhiều thứ tiếng — account mua lại từ Hàn
 # Quốc trả về mail "Battle.net 계정 인증" với nhãn "인증번호:".
-# Steam Guard: mail tu steampowered.com chua ma 5 ky tự (chu+cso). Nhan dien
-# qua nhan "Steam Guard code..." hoac ma dung mot minh tren dong trong mail Steam.
+# Steam Guard: ma 5 ky tu lay tu bang chu rieng cua Steam (khong nguyen am,
+# khong 0/1) nen co the TOAN CHU hoac toan so - khong duoc ep "phai co chu so".
+# Trong mail HTML ma nam mot minh trong 1 o <td>; Exchange/Graph hay tra HTML
+# don 1 dong va chen &nbsp;, nen phai tach theo THE (moi text node 1 dong) chu
+# khong dua vao xuong dong co san trong HTML.
 STEAM_HINT_RE = re.compile(r'steampowered|steam guard|steam support', re.IGNORECASE)
+STEAM_CODE = r'[23456789BCDFGHJKMNPQRTVWXY]{5}'
+STEAM_STANDALONE_LINE_RE = re.compile(r'^[ \t]*(' + STEAM_CODE + r')[ \t]*$', re.MULTILINE)
+# Mail thuan text kieu "... Steam Guard code: 7KQ4M" (ma cung dong voi nhan).
 STEAM_LABEL_RE = re.compile(
-    r'(?:steam guard code|M\u00e3 Steam Guard)\D{0,60}?\b([A-Z0-9]{5})\b', re.IGNORECASE
+    r'(?i:steam guard code|m\u00e3 steam guard|login code)[^\n]{0,80}?'
+    r'(?<![A-Za-z0-9])(' + STEAM_CODE + r')(?![A-Za-z0-9])'
 )
-STEAM_STANDALONE_LINE_RE = re.compile(r'^\s*([A-Z0-9]{5})\s*$', re.MULTILINE)
+
+
+def extract_steam_codes(text: str, sender: str = '') -> List[str]:
+    """Ma Steam Guard trong 1 mail. Chi quet khi chac chan la mail cua Steam."""
+    if not STEAM_HINT_RE.search((sender or '') + ' ' + text):
+        return []
+    body = re.sub(r'<(style|script)[^>]*>.*?</\1>', ' ', text, flags=re.DOTALL | re.IGNORECASE)
+    body = re.sub(r'<[^>]+>', '\n', body)
+    body = html.unescape(body).replace('\xa0', ' ').replace('\u200b', '').replace('\r', '\n')
+    return STEAM_STANDALONE_LINE_RE.findall(body) + STEAM_LABEL_RE.findall(body)
+
 
 BATTLENET_CODE_LABELS = [
     r'security code',
@@ -557,22 +575,7 @@ def extract_otp_code(text: str, game: Optional[str] = None, sender: Optional[str
         filtered.extend(c for c in matches if len(c) == 12 and c.count('-') == 2)
 
     if game in (None, 'steam'):
-        steam_matches = [
-            m
-            for m in STEAM_LABEL_RE.findall(clean)
-            if len(m) == 5 and any(ch.isdigit() for ch in m)
-        ]
-        if not steam_matches:
-            hint_src = (sender or '') + ' ' + clean
-            if STEAM_HINT_RE.search(hint_src):
-                steam_matches = [
-                    m
-                    for m in STEAM_STANDALONE_LINE_RE.findall(clean)
-                    if len(m) == 5
-                    and any(ch.isdigit() for ch in m)
-                    and any(ch.isalpha() for ch in m)
-                ]
-        filtered.extend(steam_matches)
+        filtered.extend(extract_steam_codes(text, sender))
 
     if game in (None, 'diablo'):
         # 5. Mã Battle.net/Diablo dạng 6 ký tự chữ+số, không dấu gạch. Ưu tiên
