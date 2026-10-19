@@ -2,8 +2,12 @@
 API Server & Web UI: Dịch vụ trích xuất mã xác nhận (OTP) và hiển thị hòm thư Outlook bằng python-o365 + FastAPI.
 """
 
+import os
 import re
 import html
+import hmac
+import hashlib
+import secrets
 import sys
 import json
 import socket
@@ -18,7 +22,7 @@ from email.header import decode_header
 from email.utils import parsedate_to_datetime
 
 try:
-    from fastapi import FastAPI, HTTPException
+    from fastapi import FastAPI, HTTPException, Header
     from fastapi.middleware.cors import CORSMiddleware
     from pydantic import BaseModel, Field
     import uvicorn
@@ -1078,6 +1082,61 @@ def get_code_by_email_post(req: EmailOnlyRequest):
     return get_verification_code(code_req)
 
 
+# ---------------------------------------------------------------------------
+# API cho BOT (exileapi): khoá riêng qua header X-Api-Key, CHỈ trả mã + giờ nhận thư
+# (không nội dung thư, không mật khẩu / token). Khoá lưu dạng sha256 ở bot_api_keys.json
+# NGOÀI git (repo công khai). nginx chỉ mở đúng đường này cho LAN, phần còn lại vẫn qua
+# đăng nhập ERP.  Tạo khoá:  python api_server.py --new-bot-key <tên máy>
+# ---------------------------------------------------------------------------
+BOT_KEYS_PATH = Path(os.environ.get("GOTCODE_BOT_KEYS", Path(__file__).parent / "bot_api_keys.json"))
+
+
+def _bot_keys() -> list:
+    try:
+        return json.loads(BOT_KEYS_PATH.read_text()).get("keys", [])
+    except (OSError, ValueError):
+        return []
+
+
+def _bot_key_name(key: Optional[str]) -> Optional[str]:
+    if not key:
+        return None
+    digest = hashlib.sha256(key.encode()).hexdigest()
+    for k in _bot_keys():
+        if hmac.compare_digest(digest, k.get("sha256", "")) and not k.get("disabled"):
+            return k.get("name") or "bot"
+    return None
+
+
+def new_bot_key(name: str) -> str:
+    key = "gck_" + secrets.token_urlsafe(32)
+    data = {"keys": _bot_keys() + [{"name": name, "sha256": hashlib.sha256(key.encode()).hexdigest()}]}
+    BOT_KEYS_PATH.write_text(json.dumps(data, indent=1))
+    os.chmod(BOT_KEYS_PATH, 0o600)
+    return key
+
+
+class BotCodeRequest(BaseModel):
+    email: str = Field(..., description="Email hòm thư đã có Script Key trong DB")
+    keyword: Optional[str] = Field("Path of Exile", description="Game để lọc định dạng mã")
+    limit: Optional[int] = Field(10, description="Số thư đọc tối đa (1–30)")
+
+
+@app.post("/api/bot/get-code")
+def bot_get_code(req: BotCodeRequest, x_api_key: Optional[str] = Header(None)):
+    name = _bot_key_name(x_api_key)
+    if not name:
+        raise HTTPException(status_code=401, detail="Sai hoặc thiếu X-Api-Key")
+    email = req.email.strip()
+    if "|" in email or "@" not in email:              # chỉ tra cứu theo email — không cho bot ghi Script Key vào DB
+        raise HTTPException(status_code=400, detail="Chỉ nhận địa chỉ email")
+    res = get_verification_code(AccountCodeRequest(account_str=email, keyword=req.keyword,
+                                                   limit=max(1, min(int(req.limit or 10), 30)),
+                                                   user=f"bot:{name}"))
+    return {"status": res.status, "email": res.email, "otp_code": res.otp_code,
+            "received_time": res.received_time, "all_codes_found": res.all_codes_found}
+
+
 @app.post("/api/get-code", response_model=OTPCodeResponse)
 def get_verification_code(req: AccountCodeRequest):
     """
@@ -1420,7 +1479,10 @@ def save_settings(payload: SettingsPayload):
 
 
 if __name__ == '__main__':
-    import os
+    if len(sys.argv) >= 3 and sys.argv[1] == '--new-bot-key':
+        print(new_bot_key(sys.argv[2]))
+        print(f"(chỉ hiện 1 lần — đã lưu sha256 vào {BOT_KEYS_PATH})", file=sys.stderr)
+        sys.exit(0)
     port = int(os.environ.get("PORT", 8005))
     # Mặc định chỉ nghe loopback: API này trả credential thô (mật khẩu, refresh token,
     # app password) và không có lớp xác thực nào của riêng nó. Mở ra LAN là phơi toàn bộ
