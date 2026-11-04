@@ -70,6 +70,9 @@ def init_sqlite_db():
         if "token_renew_tried_at" not in columns:
             # Lần cuối thử gia hạn (kể cả thất bại): token chết không bị gọi Microsoft lại mỗi giờ
             cursor.execute("ALTER TABLE accounts ADD COLUMN token_renew_tried_at DATETIME")
+        if "token_status" not in columns:
+            # 'live' token còn gia hạn được | 'dead' Microsoft từ chối, cần đăng nhập lại | NULL chưa biết
+            cursor.execute("ALTER TABLE accounts ADD COLUMN token_status TEXT")
         
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS settings (
@@ -685,7 +688,7 @@ def list_saved_accounts(search: Optional[str] = None, status: Optional[str] = No
     """Lấy danh sách tất cả tài khoản, lọc tìm kiếm đa trường và danh sách trạng thái từ duy nhất 1 bảng accounts trong SQLite DB"""
     with sqlite3.connect(DB_PATH) as conn:
         cursor = conn.cursor()
-        cursor.execute("SELECT email, account_str, status, otp_code, subject, sender, updated_at FROM accounts ORDER BY updated_at DESC")
+        cursor.execute("SELECT email, account_str, status, otp_code, subject, sender, updated_at, token_status FROM accounts ORDER BY updated_at DESC")
         rows = cursor.fetchall()
         
         items = []
@@ -698,7 +701,8 @@ def list_saved_accounts(search: Optional[str] = None, status: Optional[str] = No
                 "otp_code": r[3],
                 "subject": r[4],
                 "sender": r[5],
-                "updated_at": r[6]
+                "updated_at": r[6],
+                "token_status": r[7],
             }
             
             # Lọc tìm kiếm search (Case-insensitive multi-field search per User Rule #4)
@@ -1030,8 +1034,8 @@ def store_rotated_token(account_str: str, acc_info: dict, new_refresh: Optional[
     if email:
         with sqlite3.connect(DB_PATH) as conn:
             conn.execute(
-                "UPDATE accounts SET token_renewed_at = datetime('now'), token_renew_tried_at = datetime('now')"
-                " WHERE LOWER(email) = LOWER(?)",
+                "UPDATE accounts SET token_renewed_at = datetime('now'), token_renew_tried_at = datetime('now'),"
+                " token_status = 'live' WHERE LOWER(email) = LOWER(?)",
                 (email,),
             )
             conn.commit()
@@ -1047,10 +1051,12 @@ def renew_outlook_token(account_str: str, user: Optional[str] = None) -> Optiona
     res = ms_refresh_token(acc_info)
     email = acc_info.get('username')
     if 'access_token' not in res:
+        rejected = res.get('error') not in (None, 'network_error')
         with sqlite3.connect(DB_PATH) as conn:
             conn.execute(
-                "UPDATE accounts SET token_renew_tried_at = datetime('now') WHERE LOWER(email) = LOWER(?)",
-                (email or '',),
+                "UPDATE accounts SET token_renew_tried_at = datetime('now'),"
+                " token_status = CASE WHEN ? THEN 'dead' ELSE token_status END WHERE LOWER(email) = LOWER(?)",
+                (1 if rejected else 0, email or ''),
             )
             conn.commit()
         add_account_log(
@@ -1125,6 +1131,198 @@ def manual_renew_token_endpoint(req: RenewTokenRequest):
             status_code=400,
             detail=f"Microsoft không gia hạn được Token của '{req.email}' (token đã hết hạn hoặc bị thu hồi). Vui lòng dán Script Key mới.",
         )
+
+
+
+# ---------------------------------------------------------------------------
+# Lấy lại Script Key (đăng nhập lại) qua Microsoft Device Code — KHÔNG gửi mật khẩu đi đâu.
+# Máy xin mã cho hàng loạt acc chết token cùng lúc; người chỉ mở link + đăng nhập từng acc;
+# đăng nhập xong máy tự nhận refresh token mới, ghép lại Script Key (giữ mật khẩu cũ) và lưu.
+# ---------------------------------------------------------------------------
+import base64 as _base64
+import threading as _threading_relogin
+
+MS_DEVICECODE_URL = 'https://login.microsoftonline.com/consumers/oauth2/v2.0/devicecode'
+# openid/email để biết acc vừa đăng nhập đúng không; offline_access để lấy refresh token mới
+MS_RELOGIN_SCOPE = 'openid email profile offline_access https://graph.microsoft.com/Mail.Read'
+DEFAULT_CLIENT_ID = '9e5f94bc-e8a4-4e73-b8be-63364c29d753'
+RELOGIN_MAX_BATCH = 60
+
+_relogin_sessions = {}  # email(lower) -> dict phiên đăng nhập lại đang chờ
+_relogin_lock = _threading_relogin.Lock()
+
+
+def _id_token_email(id_token: str) -> str:
+    """Lấy email của tài khoản vừa đăng nhập từ id_token (để chắc đúng acc, không ghi nhầm key)."""
+    try:
+        payload = id_token.split('.')[1]
+        claims = json.loads(_base64.urlsafe_b64decode(payload + '=' * (-len(payload) % 4)))
+        return (claims.get('email') or claims.get('preferred_username') or '').strip().lower()
+    except Exception:
+        return ''
+
+
+def _client_id_for(email: str) -> str:
+    acc = get_account_from_db(email)
+    if acc:
+        cid = parse_account_string(acc).get('client_id')
+        if cid:
+            return cid
+    return DEFAULT_CLIENT_ID
+
+
+def ms_request_device_code(client_id: str) -> dict:
+    data = {'client_id': client_id, 'scope': MS_RELOGIN_SCOPE}
+    try:
+        return requests.post(MS_DEVICECODE_URL, data=data, timeout=20).json()
+    except Exception as e:
+        print(f"[RELOGIN] Không xin được mã: {e}")
+        return {'error': 'network_error'}
+
+
+def ms_poll_device_token(client_id: str, device_code: str) -> dict:
+    data = {
+        'grant_type': 'urn:ietf:params:oauth:grant-type:device_code',
+        'client_id': client_id,
+        'device_code': device_code,
+    }
+    try:
+        return requests.post(MS_TOKEN_URL, data=data, timeout=20).json()
+    except Exception:
+        return {'error': 'network_error'}
+
+
+def _relogin_public_view(email: str, sess: dict) -> dict:
+    return {
+        'email': email,
+        'user_code': sess.get('user_code'),
+        'verification_uri': sess.get('verification_uri'),
+        'status': sess.get('status'),
+        'detail': sess.get('detail', ''),
+        'expires_at': sess.get('expires_at'),
+    }
+
+
+def _start_relogin_one(email: str) -> dict:
+    email = (email or '').strip().lower()
+    acc = get_account_from_db(email)
+    if acc and parse_account_string(acc).get('provider') == 'imap':
+        sess = {'status': 'skipped', 'detail': 'Tài khoản Gmail (IMAP) không cần đăng nhập lại'}
+        return {'email': email, 'status': 'skipped', 'detail': sess['detail'], 'user_code': None, 'verification_uri': None, 'expires_at': None}
+    client_id = _client_id_for(email)
+    res = ms_request_device_code(client_id)
+    if 'device_code' not in res:
+        detail = res.get('error_description') or res.get('error') or 'Không xin được mã đăng nhập'
+        return {'email': email, 'status': 'error', 'detail': detail[:200], 'user_code': None, 'verification_uri': None, 'expires_at': None}
+    sess = {
+        'client_id': client_id,
+        'device_code': res['device_code'],
+        'user_code': res['user_code'],
+        'verification_uri': res.get('verification_uri', 'https://www.microsoft.com/link'),
+        'interval': max(int(res.get('interval', 5)), 5),
+        'expires_at': time.time() + int(res.get('expires_in', 900)),
+        'next_poll': 0.0,
+        'status': 'pending',
+        'detail': '',
+    }
+    with _relogin_lock:
+        _relogin_sessions[email] = sess
+    return _relogin_public_view(email, sess)
+
+
+def _poll_relogin_one(email: str, sess: dict, user: Optional[str] = None) -> None:
+    now = time.time()
+    if sess['status'] != 'pending':
+        return
+    if now >= sess['expires_at']:
+        sess['status'] = 'expired'
+        sess['detail'] = 'Hết hạn mã, chưa đăng nhập'
+        return
+    if now < sess['next_poll']:
+        return
+    sess['next_poll'] = now + sess['interval']
+    res = ms_poll_device_token(sess['client_id'], sess['device_code'])
+    if 'refresh_token' in res:
+        who = _id_token_email(res.get('id_token', ''))
+        if who and who != email:
+            sess['status'] = 'wrong_account'
+            sess['detail'] = f'Đã đăng nhập nhầm tài khoản {who} — không lưu. Hãy đăng xuất rồi đăng nhập đúng {email}.'
+            return
+        acc = get_account_from_db(email) or ''
+        info = parse_account_string(acc)
+        password = info.get('password', '')
+        new_str = '|'.join([email, password, res['refresh_token'], sess['client_id']])
+        save_account_to_db(account_str=new_str, status=None, user=user or 'Relogin')
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute(
+                "UPDATE accounts SET token_status = 'live', token_renewed_at = datetime('now'),"
+                " token_renew_tried_at = datetime('now') WHERE LOWER(email) = LOWER(?)",
+                (email,),
+            )
+            conn.commit()
+        add_account_log(email, action="RELOGIN_OK", details="Đăng nhập lại, đã lấy Script Key mới", user=user or 'Relogin')
+        sess['status'] = 'done'
+        sess['detail'] = 'Đã lấy Script Key mới'
+        return
+    err = res.get('error')
+    if err in ('authorization_pending', 'slow_down', 'network_error'):
+        if err == 'slow_down':
+            sess['interval'] += 5
+        return
+    sess['status'] = 'failed'
+    sess['detail'] = (res.get('error_description') or err or 'Đăng nhập thất bại')[:200]
+
+
+class ReloginStartRequest(BaseModel):
+    emails: Optional[List[str]] = Field(default=None, description="Danh sách email cần đăng nhập lại; bỏ trống + dead_only=true để lấy mọi acc chết token")
+    dead_only: bool = Field(default=False, description="True: tự chọn mọi tài khoản đang 'dead' (token chết)")
+    user: Optional[str] = Field(default=None)
+
+
+@app.post("/api/accounts/relogin/start")
+def relogin_start(req: ReloginStartRequest):
+    """Xin mã đăng nhập lại (device code) cho 1 hoặc nhiều tài khoản. Trả mã + link để người dùng đăng nhập."""
+    emails = [e.strip().lower() for e in (req.emails or []) if e and e.strip()]
+    if req.dead_only:
+        with sqlite3.connect(DB_PATH) as conn:
+            dead = [r[0] for r in conn.execute("SELECT email FROM accounts WHERE token_status = 'dead'").fetchall()]
+        emails = sorted(set(emails) | set(dead))
+    if not emails:
+        raise HTTPException(status_code=400, detail="Không có tài khoản nào để đăng nhập lại")
+    if len(emails) > RELOGIN_MAX_BATCH:
+        raise HTTPException(status_code=400, detail=f"Tối đa {RELOGIN_MAX_BATCH} tài khoản mỗi lần")
+    items = [_start_relogin_one(e) for e in emails]
+    return {"status": "success", "items": items}
+
+
+@app.get("/api/accounts/relogin/status")
+def relogin_status(user: Optional[str] = None):
+    """Kiểm từng phiên đang chờ với Microsoft; acc nào vừa đăng nhập xong thì lưu Script Key mới ngay."""
+    with _relogin_lock:
+        pending = list(_relogin_sessions.items())
+    for email, sess in pending:
+        try:
+            _poll_relogin_one(email, sess, user=user)
+        except Exception as e:
+            sess['status'] = 'failed'
+            sess['detail'] = f'Lỗi: {e}'[:200]
+    with _relogin_lock:
+        items = [_relogin_public_view(e, s) for e, s in _relogin_sessions.items()]
+        # dọn phiên đã kết thúc để lần sau gọn (giữ lại để FE đọc 1 lần cuối thì đổi; ở đây trả rồi xoá done/expired/failed)
+        counts = {}
+        for e, sdict in list(_relogin_sessions.items()):
+            counts[sdict['status']] = counts.get(sdict['status'], 0) + 1
+    return {"status": "success", "items": items, "counts": counts}
+
+
+@app.post("/api/accounts/relogin/clear")
+def relogin_clear():
+    """Xoá các phiên đã xong/hỏng/hết hạn khỏi bộ nhớ (acc đang chờ vẫn giữ)."""
+    with _relogin_lock:
+        for e in [e for e, sdict in _relogin_sessions.items() if sdict['status'] != 'pending']:
+            _relogin_sessions.pop(e, None)
+        remaining = len(_relogin_sessions)
+    return {"status": "success", "pending": remaining}
 
 
 @app.delete("/api/accounts/{email:path}")
@@ -1313,6 +1511,10 @@ def get_verification_code(req: AccountCodeRequest):
             else:
                 detail_msg = f"Token Outlook của tài khoản '{username}' đã hết hạn hoặc bị thu hồi, Microsoft không gia hạn được. Vui lòng cập nhật dòng token mới."
                 performed_by = req.user.strip() if req.user and req.user.strip() else "System"
+                if res_json.get('error') not in (None, 'network_error'):
+                    with sqlite3.connect(DB_PATH) as _c:
+                        _c.execute("UPDATE accounts SET token_status = 'dead' WHERE LOWER(email) = LOWER(?)", (username.lower(),))
+                        _c.commit()
                 add_account_log(
                     username,
                     action="FETCH_OTP_FAILED",
