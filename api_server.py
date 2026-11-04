@@ -13,6 +13,8 @@ import json
 import socket
 import imaplib
 import sqlite3
+import threading
+import time
 import requests
 from pathlib import Path
 from typing import Optional, List, Union
@@ -62,6 +64,12 @@ def init_sqlite_db():
             cursor.execute("ALTER TABLE accounts ADD COLUMN subject TEXT")
         if "sender" not in columns:
             cursor.execute("ALTER TABLE accounts ADD COLUMN sender TEXT")
+        if "token_renewed_at" not in columns:
+            # Lần cuối refresh token Outlook được gia hạn với Microsoft (NULL = chưa gia hạn lần nào)
+            cursor.execute("ALTER TABLE accounts ADD COLUMN token_renewed_at DATETIME")
+        if "token_renew_tried_at" not in columns:
+            # Lần cuối thử gia hạn (kể cả thất bại): token chết không bị gọi Microsoft lại mỗi giờ
+            cursor.execute("ALTER TABLE accounts ADD COLUMN token_renew_tried_at DATETIME")
         
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS settings (
@@ -149,6 +157,11 @@ def save_account_to_db(
             VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
             ON CONFLICT(email) DO UPDATE SET
                 account_str = excluded.account_str,
+                -- dán Script Key mới → lượt gia hạn kế tiếp thử lại ngay
+                token_renew_tried_at = CASE
+                    WHEN excluded.account_str != accounts.account_str THEN NULL
+                    ELSE accounts.token_renew_tried_at
+                END,
                 status = CASE 
                     WHEN excluded.status IS NOT NULL AND excluded.status != '' THEN excluded.status 
                     ELSE COALESCE(accounts.status, 'Chưa sử dụng') 
@@ -984,38 +997,101 @@ def get_account_logs(email: str):
         return {"status": "success", "email": clean_email, "logs": logs}
 
 
-def auto_renew_outlook_token(account_str: str, user: Optional[str] = None) -> Optional[str]:
-    """
-    Tự động gọi API Renew Outlook Token (https://api-tools.shopmailmmo.com/api/v1/public/outlook/renew)
-    khi refresh token bị hết hạn. Trả về account_str mới nếu thành công, hoặc None nếu thất bại.
-    """
-    if not account_str or '|' not in account_str:
-        return None
+MS_TOKEN_URL = 'https://login.microsoftonline.com/consumers/oauth2/v2.0/token'
+# offline_access để Microsoft luôn trả refresh token mới (token xoay vòng): lưu token mới là token sống tiếp
+MS_MAIL_SCOPE = 'https://graph.microsoft.com/Mail.Read offline_access'
+# Gia hạn định kỳ: refresh token Outlook hết hạn nếu bỏ không quá ~90 ngày → gia hạn mỗi 7 ngày là dư an toàn
+TOKEN_RENEW_INTERVAL_DAYS = int(os.environ.get("TOKEN_RENEW_INTERVAL_DAYS", "7"))
+TOKEN_RENEW_CHECK_SECONDS = 3600
 
-    renew_url = "https://api-tools.shopmailmmo.com/api/v1/public/outlook/renew"
+
+def ms_refresh_token(acc_info: dict) -> dict:
+    """Đổi refresh token lấy access token + refresh token mới, CHỈ gọi Microsoft (không gửi Script Key cho bên
+    thứ ba). Trả JSON của Microsoft; lỗi mạng trả {'error': 'network_error'}."""
+    data = {
+        'client_id': acc_info.get('client_id'),
+        'grant_type': 'refresh_token',
+        'refresh_token': acc_info.get('refresh_token'),
+        'scope': MS_MAIL_SCOPE,
+    }
     try:
-        res = requests.post(renew_url, json={"data": account_str}, timeout=15)
-        if res.status_code == 200:
-            res_json = res.json()
-            if res_json.get("success") and res_json.get("data"):
-                new_account_str = res_json["data"]
-                # Lưu account_str mới và giữ nguyên trạng thái hiện tại
-                save_account_to_db(account_str=new_account_str, status=None, user=user)
-                acc_info = parse_account_string(new_account_str)
-                email = acc_info.get("username")
-                if email:
-                    add_account_log(
-                        email,
-                        action="AUTO_RENEW_TOKEN",
-                        details="Tự động Gia Hạn (Renew) Token thành công qua api-tools.shopmailmmo.com",
-                        user=user or "System",
-                    )
-                return new_account_str
-            else:
-                print(f"[AUTO_RENEW] API shopmailmmo báo lỗi: {res_json}")
+        return requests.post(MS_TOKEN_URL, data=data, timeout=20).json()
     except Exception as e:
-        print(f"[AUTO_RENEW_EXCEPTION] Lỗi khi kết nối tới api-tools.shopmailmmo.com: {e}")
-    return None
+        print(f"[RENEW] Không gọi được Microsoft: {e}")
+        return {'error': 'network_error'}
+
+
+def store_rotated_token(account_str: str, acc_info: dict, new_refresh: Optional[str]) -> str:
+    """Lưu refresh token mới Microsoft vừa cấp (giữ nguyên trạng thái) và ghi giờ gia hạn. Trả account_str mới."""
+    email = (acc_info.get('username') or '').strip().lower()
+    if new_refresh and new_refresh != acc_info.get('refresh_token'):
+        account_str = '|'.join([acc_info['username'], acc_info['password'], new_refresh, acc_info['client_id']])
+        save_account_to_db(account_str=account_str, status=None)
+    if email:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute(
+                "UPDATE accounts SET token_renewed_at = datetime('now'), token_renew_tried_at = datetime('now')"
+                " WHERE LOWER(email) = LOWER(?)",
+                (email,),
+            )
+            conn.commit()
+    return account_str
+
+
+def renew_outlook_token(account_str: str, user: Optional[str] = None) -> Optional[str]:
+    """Gia hạn refresh token 1 tài khoản Outlook qua Microsoft. Trả account_str mới, None nếu token đã chết
+    (khi đó chỉ còn cách dán Script Key mới)."""
+    acc_info = parse_account_string(account_str)
+    if acc_info['provider'] == 'imap' or not acc_info.get('refresh_token') or not acc_info.get('client_id'):
+        return None
+    res = ms_refresh_token(acc_info)
+    email = acc_info.get('username')
+    if 'access_token' not in res:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute(
+                "UPDATE accounts SET token_renew_tried_at = datetime('now') WHERE LOWER(email) = LOWER(?)",
+                (email or '',),
+            )
+            conn.commit()
+        add_account_log(
+            email, action="RENEW_TOKEN_FAILED", details=f"Microsoft từ chối: {res.get('error')}", user=user or "System"
+        )
+        return None
+    new_str = store_rotated_token(account_str, acc_info, res.get('refresh_token'))
+    add_account_log(email, action="RENEW_TOKEN", details="Gia hạn token với Microsoft thành công", user=user or "System")
+    return new_str
+
+
+def renew_due_tokens() -> dict:
+    """Gia hạn mọi tài khoản Outlook chưa được thử gia hạn trong TOKEN_RENEW_INTERVAL_DAYS ngày."""
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute(
+            """
+            SELECT account_str FROM accounts
+            WHERE token_renew_tried_at IS NULL OR token_renew_tried_at < datetime('now', ?)
+            """,
+            (f"-{TOKEN_RENEW_INTERVAL_DAYS} days",),
+        ).fetchall()
+    result = {'ok': 0, 'failed': 0, 'skipped': 0}
+    for (account_str,) in rows:
+        acc_info = parse_account_string(account_str or '')
+        if acc_info['provider'] == 'imap' or not acc_info.get('refresh_token'):
+            result['skipped'] += 1
+            continue
+        result['ok' if renew_outlook_token(account_str, user="Auto Renew") else 'failed'] += 1
+        time.sleep(1)  # không dồn dập Microsoft
+    return result
+
+
+def _token_renew_loop():
+    while True:
+        try:
+            r = renew_due_tokens()
+            if r['ok'] or r['failed']:
+                print(f"[AUTO_RENEW] gia hạn xong: {r}")
+        except Exception as e:
+            print(f"[AUTO_RENEW] lỗi vòng gia hạn: {e}")
+        time.sleep(TOKEN_RENEW_CHECK_SECONDS)
 
 
 class RenewTokenRequest(BaseModel):
@@ -1025,7 +1101,7 @@ class RenewTokenRequest(BaseModel):
 
 @app.post("/api/accounts/renew-token")
 def manual_renew_token_endpoint(req: RenewTokenRequest):
-    """API gia hạn (renew) Token thủ công cho 1 tài khoản email qua shopmailmmo"""
+    """API gia hạn (renew) Token thủ công cho 1 tài khoản email, chỉ qua Microsoft"""
     raw_input = req.email.strip()
     account_str = raw_input
     if '|' not in raw_input:
@@ -1037,7 +1113,7 @@ def manual_renew_token_endpoint(req: RenewTokenRequest):
                 status_code=400, detail=f"Không tìm thấy token của email '{raw_input}' trong SQLite DB"
             )
 
-    renewed_str = auto_renew_outlook_token(account_str, user=req.user)
+    renewed_str = renew_outlook_token(account_str, user=req.user)
     if renewed_str:
         return {
             "status": "success",
@@ -1047,7 +1123,7 @@ def manual_renew_token_endpoint(req: RenewTokenRequest):
     else:
         raise HTTPException(
             status_code=400,
-            detail=f"Không thể gia hạn (Renew) Token cho '{req.email}' qua api-tools.shopmailmmo.com. Vui lòng kiểm tra lại dòng token.",
+            detail=f"Microsoft không gia hạn được Token của '{req.email}' (token đã hết hạn hoặc bị thu hồi). Vui lòng dán Script Key mới.",
         )
 
 
@@ -1220,34 +1296,12 @@ def get_verification_code(req: AccountCodeRequest):
     if provider != 'imap':
         refresh_token = acc_info.get('refresh_token')
         if refresh_token:
-            import requests
-            token_url = 'https://login.microsoftonline.com/consumers/oauth2/v2.0/token'
-            data = {
-                'client_id': client_id,
-                'grant_type': 'refresh_token',
-                'refresh_token': refresh_token,
-                'scope': 'https://graph.microsoft.com/Mail.Read'
-            }
-            res = requests.post(token_url, data=data)
-            access_token = None
-
-            if res.status_code == 200 and 'access_token' in res.json():
-                access_token = res.json()['access_token']
-            else:
-                # Tự động gia hạn (Renew) token 1 lần qua API shopmailmmo khi bị hết hạn
-                renewed_str = auto_renew_outlook_token(account_str, user=req.user)
-                if renewed_str:
-                    renewed_info = parse_account_string(renewed_str)
-                    new_refresh = renewed_info.get('refresh_token')
-                    new_client_id = renewed_info.get('client_id') or client_id
-                    if new_refresh:
-                        data['refresh_token'] = new_refresh
-                        data['client_id'] = new_client_id
-                        res_retry = requests.post(token_url, data=data)
-                        if res_retry.status_code == 200 and 'access_token' in res_retry.json():
-                            access_token = res_retry.json()['access_token']
-                            account_str = renewed_str
-                            acc_info = renewed_info
+            res_json = ms_refresh_token(acc_info)
+            access_token = res_json.get('access_token')
+            if access_token:
+                # Microsoft cấp refresh token mới mỗi lần → lưu lại là token được gia hạn luôn
+                account_str = store_rotated_token(account_str, acc_info, res_json.get('refresh_token'))
+                acc_info = parse_account_string(account_str)
 
             if access_token:
                 account.con.token_backend._cache = {'access_token': {'secret': access_token}}
@@ -1257,7 +1311,7 @@ def get_verification_code(req: AccountCodeRequest):
                     account.con.session = account.con.get_session(load_token=False)
                 account.con.session.headers['Authorization'] = f'Bearer {access_token}'
             else:
-                detail_msg = f"Token Outlook của tài khoản '{username}' đã bị hết hạn và không thể tự động gia hạn (Renew). Vui lòng cập nhật dòng token mới."
+                detail_msg = f"Token Outlook của tài khoản '{username}' đã hết hạn hoặc bị thu hồi, Microsoft không gia hạn được. Vui lòng cập nhật dòng token mới."
                 performed_by = req.user.strip() if req.user and req.user.strip() else "System"
                 add_account_log(
                     username,
@@ -1476,6 +1530,13 @@ def save_settings(payload: SettingsPayload):
         "status": "success",
         "message": "Đã lưu cấu hình phân quyền và trạng thái tập trung vào SQLite DB",
     }
+
+
+@app.on_event("startup")
+def start_token_renew_thread():
+    if os.environ.get("TOKEN_RENEW_DISABLED") == "1":
+        return
+    threading.Thread(target=_token_renew_loop, name="token-renew", daemon=True).start()
 
 
 if __name__ == '__main__':
