@@ -1411,6 +1411,21 @@ def bot_get_code(req: BotCodeRequest, x_api_key: Optional[str] = Header(None)):
             "received_time": res.received_time, "all_codes_found": res.all_codes_found}
 
 
+def _microsoft_unavailable(err: Exception) -> bool:
+    """Lỗi phía Microsoft (5xx, hết lượt thử lại, mất kết nối, quá giờ) — khác lỗi tài khoản (4xx)."""
+    if isinstance(err, requests.exceptions.HTTPError):
+        resp = getattr(err, 'response', None)
+        return resp is not None and resp.status_code >= 500
+    return isinstance(err, requests.exceptions.RequestException)
+
+
+def _short_err(err: Exception) -> str:
+    resp = getattr(err, 'response', None)
+    if resp is not None:
+        return f"HTTP {resp.status_code}"
+    return type(err).__name__
+
+
 @app.post("/api/get-code", response_model=OTPCodeResponse)
 def get_verification_code(req: AccountCodeRequest):
     """
@@ -1490,8 +1505,9 @@ def get_verification_code(req: AccountCodeRequest):
         protocol = MSGraphProtocol(api_version='v1.0')
         # timeout bắt buộc: thư viện O365 mặc định chờ Microsoft vô hạn → 1 kết nối chết treo luồng
         # vĩnh viễn, dồn đủ luồng là mọi lệnh lấy mã treo theo (sự cố 2026-11-13).
+        # request_retries=1: Graph lỗi 5xx mất ~21s/lần, mặc định 3 lần thử lại × 2 thư mục = vài phút treo
         account = Account((client_id,), protocol=protocol, auth_flow_type='public', username=username,
-                          timeout=(10, 40))
+                          timeout=(10, 40), request_retries=1)
 
 
     if provider != 'imap':
@@ -1552,16 +1568,40 @@ def get_verification_code(req: AccountCodeRequest):
                 pass
 
             messages = []
+            folder_errors = []
             for folder in folders_to_check:
                 try:
                     folder_msgs = list(folder.get_messages(limit=req.limit, order_by='receivedDateTime desc'))
                     messages.extend(folder_msgs)
-                except Exception:
+                except Exception as err:
+                    if _microsoft_unavailable(err):
+                        # Microsoft lỗi/không phản hồi: thử tiếp thư mục khác hay kiểu gọi khác chỉ nhân thêm thời gian chờ
+                        folder_errors.append(err)
+                        break
                     try:
                         folder_msgs = list(folder.get_messages(limit=req.limit))
                         messages.extend(folder_msgs)
-                    except Exception:
-                        pass
+                    except Exception as err2:
+                        folder_errors.append(err2)
+
+            if not messages and folder_errors:
+                # Trước đây lỗi bị nuốt → trả "no_messages_found", người dùng tưởng hòm thư trống
+                err = folder_errors[0]
+                down = _microsoft_unavailable(err)
+                detail_msg = (
+                    f"Microsoft Outlook đang lỗi hoặc không phản hồi khi đọc hòm thư '{username}' "
+                    f"(Microsoft trả: {_short_err(err)}). Không phải lỗi tài khoản — thử lại sau ít phút."
+                    if down else f"Không đọc được hòm thư Outlook '{username}': {_short_err(err)}"
+                )
+                add_account_log(username, action="FETCH_OTP_FAILED", details=detail_msg, user=performed_by)
+                raise HTTPException(
+                    status_code=503 if down else 502,
+                    detail={
+                        "error_code": "MICROSOFT_UNAVAILABLE" if down else "MAILBOX_READ_FAILED",
+                        "message": detail_msg,
+                        "email": username,
+                    },
+                )
 
             raw_messages = [_graph_msg_to_dict(m) for m in messages]
 
@@ -1643,6 +1683,8 @@ def get_verification_code(req: AccountCodeRequest):
         )
 
 
+    except HTTPException:
+        raise
     except Exception as e:
         performed_by = req.user.strip() if req.user and req.user.strip() else "System"
         mailbox_label = "Gmail (IMAP)" if provider == 'imap' else "Outlook"
