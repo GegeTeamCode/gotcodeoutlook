@@ -1488,7 +1488,10 @@ def get_verification_code(req: AccountCodeRequest):
             )
     else:
         protocol = MSGraphProtocol(api_version='v1.0')
-        account = Account((client_id,), protocol=protocol, auth_flow_type='public', username=username)
+        # timeout bắt buộc: thư viện O365 mặc định chờ Microsoft vô hạn → 1 kết nối chết treo luồng
+        # vĩnh viễn, dồn đủ luồng là mọi lệnh lấy mã treo theo (sự cố 2026-11-13).
+        account = Account((client_id,), protocol=protocol, auth_flow_type='public', username=username,
+                          timeout=(10, 40))
 
 
     if provider != 'imap':
